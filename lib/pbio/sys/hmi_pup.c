@@ -43,8 +43,8 @@
 pbio_light_matrix_t *pbsys_hub_light_matrix;
 
 // WRO: Slot indicator brightness (0--100%). LED duty is brightness squared.
-#define WRO_SLOT_BRIGHTNESS_IDLE (30)
-#define WRO_SLOT_BRIGHTNESS_RUN  (10)
+#define WRO_SLOT_BRIGHTNESS_IDLE (50)
+#define WRO_SLOT_BRIGHTNESS_RUN  (80)
 
 // WRO: 1 = original spinner animation while running, 0 = static slot indicator.
 #define WRO_RUN_ANIMATION        (0)
