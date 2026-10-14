@@ -42,16 +42,28 @@
 
 pbio_light_matrix_t *pbsys_hub_light_matrix;
 
+// WRO: Slot indicator brightness (0--100%). LED duty is brightness squared.
+#define WRO_SLOT_BRIGHTNESS_IDLE (30)
+#define WRO_SLOT_BRIGHTNESS_RUN  (10)
+
+// WRO: 1 = original spinner animation while running, 0 = static slot indicator.
+#define WRO_RUN_ANIMATION        (0)
+
 /**
- * Displays the idle UI. Has a square stop sign and selected slot on bottom row.
+ * Displays the idle UI. WRO: Only the selected slot on bottom row.
+ * Also used as the running indicator.
  *
  * @param brightness   Brightness (0--100%).
  */
 static void light_matrix_show_idle_ui(uint8_t brightness) {
+    // WRO: Undo any display rotation left over from the user program.
+    pbio_light_matrix_set_orientation(pbsys_hub_light_matrix, PBIO_GEOMETRY_SIDE_TOP);
     for (uint8_t r = 0; r < PBSYS_CONFIG_HMI_NUM_SLOTS; r++) {
         for (uint8_t c = 0; c < PBSYS_CONFIG_HMI_NUM_SLOTS; c++) {
-            bool is_on = r < 3 && c > 0 && c < 4;
-            is_on |= (r == 4 && c == pbsys_status_get_selected_slot());
+            // WRO: Removed stop sign. Original:
+            //   bool is_on = r < 3 && c > 0 && c < 4;
+            //   is_on |= (r == 4 && c == pbsys_status_get_selected_slot());
+            bool is_on = r == 4 && c == pbsys_status_get_selected_slot();
             pbio_light_matrix_set_pixel(pbsys_hub_light_matrix, r, c, is_on ? brightness : 0, true);
         }
     }
@@ -86,6 +98,8 @@ static pbio_error_t boot_animation_process_boot_thread(pbio_os_state_t *state, v
 // Boot and shutdown animation are the same.
 static pbio_os_process_func_t boot_animation_process_shutdown_thread = boot_animation_process_boot_thread;
 
+// WRO: Spinner animation disabled (original code kept below).
+#if WRO_RUN_ANIMATION
 /**
  * Animation frame for program running animation.
  */
@@ -118,6 +132,7 @@ static void light_matrix_start_run_animation(void) {
     pbio_light_animation_init(&pbsys_hub_light_matrix->animation, pbio_light_matrix_5x5_spinner_animation_next);
     pbio_light_animation_start(&pbsys_hub_light_matrix->animation);
 }
+#endif // WRO_RUN_ANIMATION
 
 #else
 
@@ -262,7 +277,8 @@ static pbio_error_t run_ui(pbio_os_state_t *state) {
 
         // Visually indicate current state on supported hubs.
         #if PBIO_CONFIG_LIGHT_MATRIX
-        light_matrix_show_idle_ui(100);
+        // WRO: Original brightness was 100.
+        light_matrix_show_idle_ui(WRO_SLOT_BRIGHTNESS_IDLE);
         #endif
 
         pbsys_hmi_host_update_indications();
@@ -394,7 +410,12 @@ static pbio_error_t run_ui(pbio_os_state_t *state) {
 
     // Start run animations
     #if PBIO_CONFIG_LIGHT_MATRIX
+    // WRO: Static slot indicator instead of spinner animation.
+    #if WRO_RUN_ANIMATION
     light_matrix_start_run_animation();
+    #else
+    light_matrix_show_idle_ui(WRO_SLOT_BRIGHTNESS_RUN);
+    #endif
     #endif
 
     #if PBSYS_CONFIG_STATUS_LIGHT_STATE_ANIMATIONS
