@@ -7,7 +7,9 @@
 #include <pbsys/config.h>
 #include <pbsys/status.h>
 
-#define PBSYS_CONFIG_HMI_IDLE_TIMEOUT_MS (3 * 60000)
+// WRO: Original idle timeout was 3 minutes.
+#define PBSYS_CONFIG_HMI_IDLE_TIMEOUT_MS (5 * 60000)
+
 
 #if PBSYS_CONFIG_HMI
 
