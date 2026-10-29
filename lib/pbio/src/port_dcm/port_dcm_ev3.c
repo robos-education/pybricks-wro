@@ -307,6 +307,36 @@ static pbio_error_t pbio_port_dcm_nxt_color_tx_msg(pbio_os_state_t *state, pbio_
 }
 
 /**
+ * Computes the checksum of the received color sensor calibration data.
+ *
+ * Uses CRC-16 with reflected polynomial 0xA001 and initial value 0x5AA5,
+ * computed over all bytes except the checksum itself.
+ *
+ * Based on calcCRC() and readCalibration() in leJOS NXJ, lejos.nxt.SensorPort.
+ *
+ * @param [in]  data          The received calibration data.
+ * @return                    The computed checksum, in received byte order.
+ */
+static uint16_t pbio_port_dcm_nxt_color_crc(const pbio_port_dcm_nxt_color_sensor_data_t *data) {
+    const uint8_t *bytes = (const uint8_t *)data;
+    const size_t len = offsetof(pbio_port_dcm_nxt_color_sensor_data_t, crc);
+    uint16_t crc = 0x5AA5;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t byte = bytes[i];
+        for (uint8_t bit = 0; bit < 8; bit++) {
+            if ((crc ^ byte) & 1) {
+                crc = (crc >> 1) ^ 0xA001;
+            } else {
+                crc >>= 1;
+            }
+            byte >>= 1;
+        }
+    }
+    // Sensor sends high byte first.
+    return (crc << 8) | (crc >> 8);
+}
+
+/**
  * Cached analog values when a particular light color is active.
  */
 typedef struct {
@@ -322,6 +352,18 @@ typedef struct {
     uint32_t last_sample_time;
 } pbio_port_dcm_analog_rgba_t;
 
+/**
+ * Debounced state of an analog touch sensor.
+ */
+typedef struct {
+    /** Last reported pressed state. */
+    bool pressed;
+    /** Whether readings are past the release threshold while still pressed. */
+    bool releasing;
+    /** Time (ms) at which releasing started. */
+    uint32_t release_start;
+} pbio_port_dcm_touch_t;
+
 // Device connection manager state for each port
 struct _pbio_port_dcm_t {
     pbio_os_state_t child;
@@ -330,6 +372,10 @@ struct _pbio_port_dcm_t {
     pbio_port_dcm_category_t category;
     pbio_port_dcm_analog_rgba_t nxt_rgba;
     pbio_port_dcm_nxt_color_sensor_state_t nxt_color_state;
+    /** State of an analog touch sensor on pin 1 (NXT). */
+    pbio_port_dcm_touch_t p1_touch;
+    /** State of an analog touch sensor on pin 6 (EV3). */
+    pbio_port_dcm_touch_t p6_touch;
 };
 
 static pbio_port_dcm_t dcm_state[PBIO_CONFIG_PORT_DCM_NUM_DEV];
@@ -354,6 +400,13 @@ pbio_error_t pbio_port_dcm_thread(pbio_os_state_t *state, pbio_os_timer_t *timer
     debug_pr("Start device scan\n");
     dcm->category = DCM_CATEGORY_NONE;
     dcm->connected = false;
+    dcm->p1_touch = (pbio_port_dcm_touch_t) {0};
+    dcm->p6_touch = (pbio_port_dcm_touch_t) {0};
+
+    // On some platforms, pin 6 works as GPIO only while its ADC channel is
+    // disabled. Detection and device setup need the GPIO, so disable it until
+    // a device needs analog values.
+    pbdrv_adc_ch_enable(pins->adc_p6, false);
 
     // Wait for any device to be connected.
     #if PBDRV_CONFIG_IOPORT_HAS_GPIO_P2
@@ -434,8 +487,19 @@ pbio_error_t pbio_port_dcm_thread(pbio_os_state_t *state, pbio_os_timer_t *timer
                 pbio_port_dcm_nxt_color_rx_msg(&dcm->child, &dcm->nxt_color_state, pins, timer, (uint8_t *)&dcm->nxt_color_state.data + dcm->count));
         }
 
-        // REVISIT: Test checksum and exit on failure.
+        // Test checksum, which the sensor sends high byte first. On failure,
+        // exit so that detection starts over and we try again.
+        uint16_t crc = pbio_port_dcm_nxt_color_crc(&dcm->nxt_color_state.data);
+        if (crc != dcm->nxt_color_state.data.crc) {
+            debug_pr("NXT Color Sensor calibration checksum failed. Received: 0x%04x, computed: 0x%04x\n", dcm->nxt_color_state.data.crc, crc);
+            pbdrv_gpio_out_low(&pins->p5);
+            return PBIO_ERROR_IO;
+        }
         debug_pr("Finished initializing NXT Color Sensor.\n");
+
+        // Pin 6 is analog from here on. The first sample may be corrupted,
+        // but each reading below awaits new samples anyway.
+        pbdrv_adc_ch_enable(pins->adc_p6, true);
 
         // While plugged in, toggle through available colors and measure intensity.
         #if PBDRV_CONFIG_IOPORT_HAS_GPIO_P2
@@ -468,6 +532,15 @@ pbio_error_t pbio_port_dcm_thread(pbio_os_state_t *state, pbio_os_timer_t *timer
     }
 
     #if PBDRV_CONFIG_IOPORT_HAS_GPIO_P2
+    if (dcm->category == DCM_CATEGORY_NXT_TOUCH1_PRESSED) {
+        // The first NXT touch sensor has no ID pin, so it is only seen while
+        // pressed. Released looks the same as disconnected, so just wait for
+        // release, which is debounced by the pressed state checker.
+        PBIO_OS_AWAIT_WHILE(state, pbio_port_dcm_get_pressed(dcm, pins));
+        debug_pr("NXT Touch Sensor released or disconnected\n");
+        return PBIO_SUCCESS;
+    }
+
     // For everything else, disconnection is detected by just one pin going
     // high rather than all pins going back to the none state. This is
     // because other pins are used for data transfer and may vary between
@@ -526,7 +599,13 @@ pbio_error_t pbio_port_dcm_assert_type_id(pbio_port_dcm_t *dcm, lego_device_type
     // NXT Touch sensors can't be detected definitively, so allow passing none
     // state also. Raise only if something *else* is definitively connected.
     if (*expected_type_id == LEGO_DEVICE_TYPE_ID_NXT_TOUCH_SENSOR) {
+        // Still scanning, so category may be a transient state.
+        if (!dcm->connected) {
+            return PBIO_SUCCESS;
+        }
         switch (dcm->category) {
+            // This one is technically covered by the early exit above, but
+            // left in for clarity.
             case DCM_CATEGORY_NONE:
             case DCM_CATEGORY_NXT_TOUCH1_PRESSED:
             case DCM_CATEGORY_NXT_ANALOG_OTHER:
@@ -599,6 +678,70 @@ uint32_t pbio_port_dcm_get_analog_value(pbio_port_dcm_t *dcm, const pbdrv_ioport
 
     // Everything else measures analog on pin 1.
     return pbio_port_dcm_get_mv(pins, 1);
+}
+
+// Touch sensor thresholds (mV). Released is a clean signal near the supply
+// rail, while pressed is noisy with occasional single-sample spikes towards
+// released, so the release threshold is close to the released level.
+#define DCM_TOUCH_EV3_PRESS_MV (3000)
+#define DCM_TOUCH_EV3_RELEASE_MV (1000)
+#define DCM_TOUCH_NXT_PRESS_MV (3000)
+#define DCM_TOUCH_NXT_RELEASE_MV (4700)
+
+// Contacts can briefly open while pressed, so release is only reported once
+// readings have been past the release threshold for this long.
+#define DCM_TOUCH_RELEASE_DEBOUNCE_MS (20)
+
+/**
+ * Updates the debounced touch sensor state. Press is reported immediately,
+ * release only after it has been stable for ::DCM_TOUCH_RELEASE_DEBOUNCE_MS.
+ *
+ * @param [in]  touch         The touch sensor state.
+ * @param [in]  past_press    Whether the reading is past the press threshold.
+ * @param [in]  past_release  Whether the reading is past the release threshold.
+ * @return                    The updated pressed state.
+ */
+static bool pbio_port_dcm_update_touch(pbio_port_dcm_touch_t *touch, bool past_press, bool past_release) {
+
+    if (!touch->pressed) {
+        touch->pressed = past_press;
+        touch->releasing = false;
+        return touch->pressed;
+    }
+
+    // Still pressed, so cancel any pending release.
+    if (!past_release) {
+        touch->releasing = false;
+        return true;
+    }
+
+    uint32_t now = pbdrv_clock_get_ms();
+    if (!touch->releasing) {
+        touch->releasing = true;
+        touch->release_start = now;
+    }
+    if (now - touch->release_start >= DCM_TOUCH_RELEASE_DEBOUNCE_MS) {
+        touch->pressed = false;
+        touch->releasing = false;
+    }
+    return touch->pressed;
+}
+
+bool pbio_port_dcm_get_pressed(pbio_port_dcm_t *dcm, const pbdrv_ioport_pins_t *pins) {
+
+    #if PBDRV_CONFIG_IOPORT_HAS_GPIO_P2
+    // EV3 touch sensor on pin 6 is high when pressed.
+    if (dcm->category == DCM_CATEGORY_EV3_ANALOG) {
+        uint32_t mv = pbio_port_dcm_get_mv(pins, 6);
+        return pbio_port_dcm_update_touch(&dcm->p6_touch,
+            mv > DCM_TOUCH_EV3_PRESS_MV, mv < DCM_TOUCH_EV3_RELEASE_MV);
+    }
+    #endif
+
+    // NXT touch sensor on pin 1 is low when pressed.
+    uint32_t mv = pbio_port_dcm_get_mv(pins, 1);
+    return pbio_port_dcm_update_touch(&dcm->p1_touch,
+        mv < DCM_TOUCH_NXT_PRESS_MV, mv > DCM_TOUCH_NXT_RELEASE_MV);
 }
 
 /**
@@ -754,22 +897,31 @@ pbio_error_t pbio_port_dcm_get_light_intensity(pbio_port_dcm_t *dcm, uint32_t *r
     return PBIO_SUCCESS;
 }
 
-pbsys_telemetry_error_t pbio_port_dcm_get_telemetry(pbio_port_dcm_t *dcm, pbsys_telemetry_packet_t *tel, uint32_t *size) {
+pbsys_telemetry_error_t pbio_port_dcm_get_telemetry(pbio_port_dcm_t *dcm, const pbdrv_ioport_pins_t *pins, pbsys_telemetry_packet_t *tel, uint32_t *size) {
 
-    if (dcm->category == DCM_CATEGORY_EV3_ANALOG) {
+    // Best-effort display for useful info despite device limitations:
+    // - The only EV3 analog sensor ever known is a touch sensor.
+    // - The old style NXT Touch Sensor only shows when pressed.
+    // - The sound sensor shows up as a Touch Sensor as a side effect
+    //   but will still report correct analog values for volume.
+    if (dcm->category == DCM_CATEGORY_EV3_ANALOG ||
+        dcm->category == DCM_CATEGORY_NXT_TOUCH1_PRESSED ||
+        dcm->category == DCM_CATEGORY_NXT_ANALOG_OTHER) {
         if (*size < sizeof(uint8_t)) {
             return PBSYS_TELEMETRY_ERROR_NO_ROOM;
         }
-        tel->id = LEGO_DEVICE_TYPE_ID_EV3_TOUCH_SENSOR;
+        tel->id = dcm->category == DCM_CATEGORY_EV3_ANALOG ?
+            LEGO_DEVICE_TYPE_ID_EV3_TOUCH_SENSOR :
+            LEGO_DEVICE_TYPE_ID_NXT_TOUCH_SENSOR;
 
-        // Todo, use mode 0 and read analog.
-        tel->mode = 1;
-        tel->payload[0] = 1;
+        // Pressed state.
+        tel->mode = 0;
+        tel->payload[0] = pbio_port_dcm_get_pressed(dcm, pins);
         *size = sizeof(uint8_t);
         return PBSYS_TELEMETRY_SUCCESS;
     }
 
-    // TODO
+    // Uknown device.
     tel->id = LEGO_DEVICE_TYPE_ID_NONE;
     tel->mode = 0;
     *size = 0;

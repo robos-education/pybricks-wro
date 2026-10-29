@@ -59,6 +59,18 @@ pbio_error_t pbio_port_dcm_set_type_id(pbio_port_dcm_t *dcm, lego_device_type_id
 uint32_t pbio_port_dcm_get_analog_value(pbio_port_dcm_t *dcm, const pbdrv_ioport_pins_t *pins, bool active);
 
 /**
+ * Gets the pressed state of a touch sensor connected to the port.
+ *
+ * Uses hysteresis around the threshold, so the state is updated each time
+ * this is called.
+ *
+ * @param [in]  dcm         The device connection manager.
+ * @param [in]  pins        The ioport pins.
+ * @return                  True if pressed, false if released.
+ */
+bool pbio_port_dcm_get_pressed(pbio_port_dcm_t *dcm, const pbdrv_ioport_pins_t *pins);
+
+/**
  * Gets the color measured by an analog color sensor on the port, in a device
  * independent HSV format that is comparable across sensors.
  *
@@ -97,7 +109,7 @@ pbio_error_t pbio_port_dcm_get_color(pbio_port_dcm_t *dcm, pbio_color_t *color_h
  */
 pbio_error_t pbio_port_dcm_get_light_intensity(pbio_port_dcm_t *dcm, uint32_t *reflected, uint32_t *ambient, lego_device_type_id_t *id, uint8_t *mode);
 
-pbsys_telemetry_error_t pbio_port_dcm_get_telemetry(pbio_port_dcm_t *dcm, pbsys_telemetry_packet_t *tel, uint32_t *size);
+pbsys_telemetry_error_t pbio_port_dcm_get_telemetry(pbio_port_dcm_t *dcm, const pbdrv_ioport_pins_t *pins, pbsys_telemetry_packet_t *tel, uint32_t *size);
 
 #else // PBIO_CONFIG_PORT_DCM
 
@@ -121,6 +133,10 @@ static inline uint32_t pbio_port_dcm_get_analog_value(pbio_port_dcm_t *dcm, cons
     return 0;
 }
 
+static inline bool pbio_port_dcm_get_pressed(pbio_port_dcm_t *dcm, const pbdrv_ioport_pins_t *pins) {
+    return false;
+}
+
 static inline pbio_error_t pbio_port_dcm_get_color(pbio_port_dcm_t *dcm, pbio_color_t *color_hsv, lego_device_type_id_t *id, uint8_t *mode) {
     return PBIO_ERROR_NO_DEV;
 }
@@ -133,7 +149,7 @@ static inline pbio_error_t pbio_port_dcm_thread(pbio_os_state_t *state, pbio_os_
     return PBIO_ERROR_NOT_SUPPORTED;
 }
 
-static inline pbsys_telemetry_error_t pbio_port_dcm_get_telemetry(pbio_port_dcm_t *dcm, pbsys_telemetry_packet_t *tel, uint32_t *size) {
+static inline pbsys_telemetry_error_t pbio_port_dcm_get_telemetry(pbio_port_dcm_t *dcm, const pbdrv_ioport_pins_t *pins, pbsys_telemetry_packet_t *tel, uint32_t *size) {
     return PBSYS_TELEMETRY_ERROR_NO_REPORT;
 }
 
