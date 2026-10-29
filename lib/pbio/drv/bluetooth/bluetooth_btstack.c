@@ -2846,9 +2846,16 @@ pbio_error_t pbdrv_bluetooth_peer_connect(const uint8_t *address) {
 
     DEBUG_PRINT("Connecting to peer %s.\n", bd_addr_to_str(ch->address));
 
-    // No pairing: connecting is just paging a known address.
-    if (l2cap_create_channel(peer_packet_handler, ch->address, PEER_PSM,
-        PBDRV_BLUETOOTH_PEER_MTU, &ch->cid) != ERROR_CODE_SUCCESS) {
+    // No pairing: connecting is just paging a known address. Outgoing
+    // channels take the GAP security level at creation, LEVEL_2 by default,
+    // which would pair with the peer. An NXT has legacy pairing only, which
+    // asks both ends for a PIN.
+    gap_security_level_t security_level = gap_get_security_level();
+    gap_set_security_level(LEVEL_0);
+    uint8_t btstack_error = l2cap_create_channel(peer_packet_handler, ch->address, PEER_PSM,
+        PBDRV_BLUETOOTH_PEER_MTU, &ch->cid);
+    gap_set_security_level(security_level);
+    if (btstack_error != ERROR_CODE_SUCCESS) {
         DEBUG_PRINT("Peer connection failed to start.\n");
         ch->err = PBIO_ERROR_FAILED;
         return PBIO_ERROR_FAILED;
@@ -3160,6 +3167,10 @@ void pbdrv_bluetooth_init(void) {
     }
     #endif // PBDRV_CONFIG_BLUETOOTH_BTSTACK_NUM_LE_HOSTS
 
+    #if PBDRV_CONFIG_BLUETOOTH_CLASSIC_HOST
+    lwrb_init(&host_connection.rx_ring, host_connection.rx_buf, sizeof(host_connection.rx_buf));
+    #endif
+
     // Proceed to start Bluetooth process only if platform init passes.
     pbio_error_t err = pbdrv_bluetooth_btstack_platform_init();
     if (err != PBIO_SUCCESS) {
@@ -3300,7 +3311,6 @@ void pbdrv_bluetooth_init(void) {
     // initiates the connection.
     rfcomm_init();
     rfcomm_register_service(host_packet_handler, RFCOMM_SERVER_CHANNEL, RFCOMM_SERVER_MTU);
-    lwrb_init(&host_connection.rx_ring, host_connection.rx_buf, sizeof(host_connection.rx_buf));
     static uint8_t spp_sdp_record[150];
     // Advertise a dedicated Pybricks UUID as the service class (the profile
     // descriptor list still declares SPP). Host apps filter serial ports on
